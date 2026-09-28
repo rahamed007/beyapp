@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 
 interface BeySlot {
   blade: string;
@@ -24,6 +24,20 @@ interface MatchAction {
   pts: number;
   player: 1 | 2;
   isFoul?: boolean;
+}
+
+interface Match {
+  id: string;
+  stadium: number | string;
+  p1Id: string;
+  p2Id: string | null;
+  p1Score: number;
+  p2Score: number;
+  p1Fouls: number;
+  p2Fouls: number;
+  status: 'pending' | 'live' | 'finished';
+  winnerId: string | null;
+  history: MatchAction[];
 }
 
 const BLADES = [
@@ -66,10 +80,10 @@ export default function App() {
     }))
   );
 
-  const [activeTab, setActiveTab] = useState<'roster' | 'pairings' | 'standings' | 'topcut'>('roster');
+  const [activeTab, setActiveTab] = useState<'roster' | 'pairings' | 'standings' | 'topcut'>('pairings');
   const [currentRound, setCurrentRound] = useState(1);
-  const [rounds, setRounds] = useState<any>({});
-  const [activeMatchModal, setActiveMatchModal] = useState<any>(null);
+  const [rounds, setRounds] = useState<{ [key: number]: Match[] }>({});
+  const [activeMatchModal, setActiveMatchModal] = useState<Match | null>(null);
   const [editingBlader, setEditingBlader] = useState<Blader | null>(null);
   const [newBladerName, setNewBladerName] = useState("");
   const [topCutMatches, setTopCutMatches] = useState<any>(null);
@@ -96,7 +110,7 @@ export default function App() {
       return (b.pointsFor - b.pointsAgainst) - (a.pointsFor - a.pointsAgainst);
     });
 
-    const pairings: any[] = [];
+    const pairings: Match[] = [];
     const assigned = new Set<string>();
 
     let byeBlader: Blader | null = null;
@@ -156,7 +170,7 @@ export default function App() {
           p2Fouls: 0,
           status: 'pending',
           winnerId: null,
-          history: [] as MatchAction[]
+          history: []
         });
       }
     }
@@ -179,6 +193,13 @@ export default function App() {
 
     return pairings;
   };
+
+  useEffect(() => {
+    if (!rounds[1]) {
+      const r1 = generateSwissPairings(bladers, 1);
+      setRounds({ 1: r1 });
+    }
+  }, []);
 
   const handleStartTournament = () => {
     const checkedCount = bladers.filter(b => b.checkedIn).length;
@@ -209,7 +230,72 @@ export default function App() {
       });
   }, [bladers]);
 
-  // Scoring
+  // UNDO A FINISHED MATCH FROM THE MATCHES SECTION
+  const handleUndoCompletedMatch = (matchId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const roundMatches = rounds[currentRound] || [];
+    const targetMatch = roundMatches.find(m => m.id === matchId);
+    if (!targetMatch || targetMatch.status !== 'finished') return;
+
+    if (!window.confirm("Undo this match result and reopen it for scoring?")) return;
+
+    const { p1Id, p2Id, p1Score, p2Score, winnerId } = targetMatch;
+
+    // Roll back player stats
+    setBladers(prev => prev.map(b => {
+      if (b.id === p1Id) {
+        const wasWin = winnerId === p1Id;
+        const past = [...b.pastOpponents];
+        if (p2Id) {
+          const idx = past.lastIndexOf(p2Id);
+          if (idx !== -1) past.splice(idx, 1);
+        }
+        return {
+          ...b,
+          wins: Math.max(0, b.wins - (wasWin ? 1 : 0)),
+          losses: Math.max(0, b.losses - (!wasWin ? 1 : 0)),
+          pointsFor: Math.max(0, b.pointsFor - p1Score),
+          pointsAgainst: Math.max(0, b.pointsAgainst - p2Score),
+          pastOpponents: past,
+          hadBye: p2Id === null ? false : b.hadBye
+        };
+      }
+      if (b.id === p2Id) {
+        const wasWin = winnerId === p2Id;
+        const past = [...b.pastOpponents];
+        const idx = past.lastIndexOf(p1Id);
+        if (idx !== -1) past.splice(idx, 1);
+        return {
+          ...b,
+          wins: Math.max(0, b.wins - (wasWin ? 1 : 0)),
+          losses: Math.max(0, b.losses - (!wasWin ? 1 : 0)),
+          pointsFor: Math.max(0, b.pointsFor - p2Score),
+          pointsAgainst: Math.max(0, b.pointsAgainst - p1Score),
+          pastOpponents: past
+        };
+      }
+      return b;
+    }));
+
+    // Reset match status to pending with 0-0 so it can be re-scored
+    const updatedMatch: Match = {
+      ...targetMatch,
+      status: 'pending',
+      winnerId: null,
+      p1Score: 0,
+      p2Score: 0,
+      p1Fouls: 0,
+      p2Fouls: 0,
+      history: []
+    };
+
+    setRounds(prev => ({
+      ...prev,
+      [currentRound]: prev[currentRound].map(m => m.id === matchId ? updatedMatch : m)
+    }));
+  };
+
+  // Scoring in referee console
   const handleApplyFinish = (playerNum: 1 | 2, finishType: string, points: number) => {
     if (!activeMatchModal || activeMatchModal.winnerId) return;
     const cur = { ...activeMatchModal };
@@ -272,12 +358,12 @@ export default function App() {
     setActiveMatchModal(cur);
   };
 
-  // FULL UNDO FUNCTIONALITY
-  const handleUndo = () => {
+  // Step-by-step undo within referee console
+  const handleUndoStepInModal = () => {
     if (!activeMatchModal || !activeMatchModal.history || activeMatchModal.history.length === 0) return;
     const cur = { ...activeMatchModal };
     const history = [...cur.history];
-    const lastAction: MatchAction = history.pop()!;
+    const lastAction = history.pop()!;
 
     if (lastAction.isFoul) {
       if (lastAction.player === 1) {
@@ -295,7 +381,6 @@ export default function App() {
       }
     }
 
-    // Reopen match if it was previously marked finished
     cur.winnerId = null;
     cur.status = history.length > 0 ? 'live' : 'pending';
     cur.history = history;
@@ -303,25 +388,11 @@ export default function App() {
     setActiveMatchModal(cur);
   };
 
-  const handleResetMatch = () => {
-    if (!window.confirm("Reset this match score back to 0 - 0?")) return;
-    setActiveMatchModal({
-      ...activeMatchModal,
-      p1Score: 0,
-      p2Score: 0,
-      p1Fouls: 0,
-      p2Fouls: 0,
-      status: 'pending',
-      winnerId: null,
-      history: []
-    });
-  };
-
   const handleSaveMatchScore = () => {
     if (!activeMatchModal) return;
-    setRounds((prev: any) => {
+    setRounds(prev => {
       const matchArr = [...(prev[currentRound] || [])];
-      const idx = matchArr.findIndex((m: any) => m.id === activeMatchModal.id);
+      const idx = matchArr.findIndex(m => m.id === activeMatchModal.id);
       if (idx !== -1) matchArr[idx] = activeMatchModal;
       return { ...prev, [currentRound]: matchArr };
     });
@@ -360,9 +431,9 @@ export default function App() {
 
   const handleNextRound = () => {
     const currentMatches = rounds[currentRound] || [];
-    const allDone = currentMatches.every((m: any) => m.status === 'finished');
+    const allDone = currentMatches.every(m => m.status === 'finished');
     if (!allDone) {
-      alert("Please complete all active arena matches before moving to the next round!");
+      alert("Please finish all active stadium matches before advancing!");
       return;
     }
 
@@ -373,7 +444,7 @@ export default function App() {
       return;
     }
     const nextPairings = generateSwissPairings(bladers, nextR);
-    setRounds((prev: any) => ({ ...prev, [nextR]: nextPairings }));
+    setRounds(prev => ({ ...prev, [nextR]: nextPairings }));
     setCurrentRound(nextR);
   };
 
@@ -388,12 +459,12 @@ export default function App() {
   };
 
   const activeMatches = rounds[currentRound] || [];
-  const currentRoundFinished = activeMatches.length > 0 && activeMatches.every((m: any) => m.status === 'finished');
+  const currentRoundFinished = activeMatches.length > 0 && activeMatches.every(m => m.status === 'finished');
   const checkedInCount = bladers.filter(b => b.checkedIn).length;
 
   return (
     <div className="min-h-screen bg-[#070b14] text-slate-100 font-sans pb-16">
-      {/* Top Header */}
+      {/* Header */}
       <header className="sticky top-0 z-30 bg-[#0b101f]/95 backdrop-blur border-b border-cyan-500/20 px-4 py-3 flex items-center justify-between shadow-xl">
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-[#ff4500] to-cyan-400 p-[2px] flex items-center justify-center font-black text-black">
@@ -409,7 +480,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Tab Switcher */}
+        {/* Navigation Tabs */}
         <div className="flex gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800">
           <button
             onClick={() => setActiveTab('roster')}
@@ -438,10 +509,10 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Container */}
+      {/* Main Content Area */}
       <main className="max-w-6xl mx-auto p-4 sm:p-6">
 
-        {/* TAB 1: ROSTER & 3v3 DECKS */}
+        {/* TAB 1: REGISTRATION & 3v3 DECK */}
         {activeTab === 'roster' && (
           <div className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-4 p-4 rounded-2xl bg-slate-900/80 border border-slate-800">
@@ -561,7 +632,7 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: ARENA MATCHES */}
+        {/* TAB 2: ARENA MATCHES (WITH UNDO ON CARD) */}
         {activeTab === 'pairings' && (
           <div className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-4 p-4 rounded-2xl bg-slate-900/80 border border-slate-800">
@@ -578,7 +649,9 @@ export default function App() {
                       </span>
                     )}
                   </h2>
-                  <p className="text-xs text-slate-400">First to 4 points. Tap any arena match to open referee score controls.</p>
+                  <p className="text-xs text-slate-400">
+                    Tap any match to score. If a match was finalized by mistake, click <strong>"↺ Undo Result"</strong> on the card to reopen it.
+                  </p>
                 </div>
               </div>
 
@@ -614,7 +687,7 @@ export default function App() {
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {activeMatches.map((m: any) => {
+                {activeMatches.map((m) => {
                   const p1 = bladers.find(b => b.id === m.p1Id);
                   const p2 = bladers.find(b => b.id === m.p2Id);
                   const isBye = m.stadium === 'BYE';
@@ -628,56 +701,79 @@ export default function App() {
                         isBye
                           ? 'bg-slate-900/40 border-slate-800 cursor-default opacity-75'
                           : isFinished
-                          ? 'bg-slate-900/60 border-slate-800'
+                          ? 'bg-slate-900/70 border-slate-800 hover:border-slate-700'
                           : 'bg-slate-900 border-cyan-900/60 hover:border-cyan-400 shadow-lg'
                       }`}
                     >
+                      {/* Stadium & Status Header */}
                       <div className="flex items-center justify-between border-b border-slate-800/80 pb-2 mb-3">
                         <span className="font-extrabold text-xs uppercase tracking-wider text-cyan-400">
                           {isBye ? "Automatic Bye" : `Table / Stadium ${m.stadium}`}
                         </span>
-                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase ${
-                          isFinished ? 'bg-emerald-500/20 text-emerald-400' : 'bg-[#ff4500]/20 text-[#ff7744]'
-                        }`}>
-                          {isBye ? "Free Pass (+4)" : isFinished ? "Finished" : "Live Battle"}
-                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase ${
+                            isFinished ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-[#ff4500]/20 text-[#ff7744] border border-[#ff4500]/30'
+                          }`}>
+                            {isBye ? "Free Pass (+4)" : isFinished ? "Finished" : "Live Battle"}
+                          </span>
+                        </div>
                       </div>
 
+                      {/* Opponents & Score */}
                       <div className="space-y-3">
                         <div className="flex items-center justify-between">
                           <div>
-                            <div className={`font-bold text-sm ${m.winnerId === p1?.id ? 'text-cyan-300 font-black' : 'text-slate-200'}`}>
+                            <div className={`font-bold text-sm ${m.winnerId === p1?.id ? 'text-amber-400 font-black' : 'text-slate-200'}`}>
                               {p1?.name}
                             </div>
-                            <div className="text-[11px] text-slate-400 truncate max-w-[180px]">
+                            <div className="text-[11px] text-slate-400 truncate max-w-[170px]">
                               {p1?.deck[0].blade} ({p1?.deck[0].ratchet} {p1?.deck[0].bit})
                             </div>
                           </div>
-                          <span className="text-xl font-black text-cyan-400">{m.p1Score}</span>
+                          <span className="text-xl font-black font-mono text-cyan-400">{m.p1Score}</span>
                         </div>
 
                         <div className="text-center text-[10px] text-slate-600 font-bold uppercase">VS</div>
 
                         <div className="flex items-center justify-between">
                           <div>
-                            <div className={`font-bold text-sm ${m.winnerId === p2?.id ? 'text-cyan-300 font-black' : 'text-slate-200'}`}>
+                            <div className={`font-bold text-sm ${m.winnerId === p2?.id ? 'text-amber-400 font-black' : 'text-slate-200'}`}>
                               {isBye ? 'No Opponent (Bye Round)' : p2?.name}
                             </div>
                             {!isBye && (
-                              <div className="text-[11px] text-slate-400 truncate max-w-[180px]">
+                              <div className="text-[11px] text-slate-400 truncate max-w-[170px]">
                                 {p2?.deck[0].blade} ({p2?.deck[0].ratchet} {p2?.deck[0].bit})
                               </div>
                             )}
                           </div>
-                          <span className="text-xl font-black text-cyan-400">{m.p2Score}</span>
+                          <span className="text-xl font-black font-mono text-cyan-400">{m.p2Score}</span>
                         </div>
                       </div>
 
+                      {/* CARD ACTION BUTTONS (INCLUDES UNDO FOR FINISHED MATCHES) */}
                       {!isBye && (
-                        <div className="mt-4 pt-2 border-t border-slate-800/80 text-center">
-                          <span className="text-[11px] font-bold text-slate-400 hover:text-cyan-300">
-                            {isFinished ? "Review / Edit Match Score" : "▶ Tap to Score Match"}
-                          </span>
+                        <div className="mt-4 pt-2.5 border-t border-slate-800/80 flex items-center justify-between">
+                          {isFinished ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={(e) => handleUndoCompletedMatch(m.id, e)}
+                                className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-[11px] font-black transition flex items-center gap-1 active:scale-95"
+                                title="Undo match score and reopen for refereeing"
+                              >
+                                <span>↺ Undo Result / Reopen</span>
+                              </button>
+                              <span className="text-[11px] text-slate-400 hover:text-white font-semibold">
+                                View Details ➔
+                              </span>
+                            </>
+                          ) : (
+                            <div className="w-full text-center">
+                              <span className="text-xs font-bold text-cyan-400 hover:text-cyan-300 flex items-center justify-center gap-1">
+                                <span>▶</span> Tap to Open Referee Scoring
+                              </span>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -780,7 +876,7 @@ export default function App() {
 
       </main>
 
-      {/* REFEREE SCORING MODAL WITH DEDICATED UNDO BUTTON */}
+      {/* REFEREE SCORING MODAL WITH CLEAR UNDO BUTTONS */}
       {activeMatchModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md">
           <div className="w-full max-w-2xl bg-[#0d1322] border border-cyan-500/40 rounded-3xl p-6 shadow-2xl space-y-4">
@@ -791,7 +887,7 @@ export default function App() {
                 </h3>
                 <p className="text-[11px] text-slate-400">First to 4 points (Spin 1pt, Over 2pts, Burst 2pts, Xtreme 3pts)</p>
               </div>
-              <button onClick={() => setActiveMatchModal(null)} className="text-slate-400 hover:text-white text-xl font-bold">&times;</button>
+              <button onClick={() => setActiveMatchModal(null)} className="text-slate-400 hover:text-white text-xl font-bold leading-none">&times;</button>
             </div>
 
             {/* Victory banner */}
@@ -810,7 +906,7 @@ export default function App() {
                   <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 text-center">
                     <div className="text-sm font-black text-white truncate">{p1?.name}</div>
                     <div className="text-[11px] text-cyan-400 truncate mb-2">{p1?.deck[0].blade}</div>
-                    <div className="text-5xl font-black text-white mb-2">{activeMatchModal.p1Score}</div>
+                    <div className="text-5xl font-black font-mono text-white mb-2">{activeMatchModal.p1Score}</div>
                     <div className="text-[11px] text-slate-400 mb-3">Launch Fouls: {activeMatchModal.p1Fouls}/2</div>
                     <div className="grid grid-cols-2 gap-1.5 text-xs font-bold">
                       <button onClick={() => handleApplyFinish(1, 'Spin', 1)} className="bg-slate-800 hover:bg-slate-700 py-2 rounded-lg text-slate-200">+1 Spin</button>
@@ -832,7 +928,7 @@ export default function App() {
                   <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 text-center">
                     <div className="text-sm font-black text-white truncate">{p2?.name}</div>
                     <div className="text-[11px] text-cyan-400 truncate mb-2">{p2?.deck[0].blade}</div>
-                    <div className="text-5xl font-black text-white mb-2">{activeMatchModal.p2Score}</div>
+                    <div className="text-5xl font-black font-mono text-white mb-2">{activeMatchModal.p2Score}</div>
                     <div className="text-[11px] text-slate-400 mb-3">Launch Fouls: {activeMatchModal.p2Fouls}/2</div>
                     <div className="grid grid-cols-2 gap-1.5 text-xs font-bold">
                       <button onClick={() => handleApplyFinish(2, 'Spin', 1)} className="bg-slate-800 hover:bg-slate-700 py-2 rounded-lg text-slate-200">+1 Spin</button>
@@ -848,9 +944,9 @@ export default function App() {
               })()}
             </div>
 
-            {/* UNDO & RESET BAR */}
+            {/* UNDO & RESET ROW IN REFEREE CONSOLE */}
             <div className="bg-slate-950 p-3 rounded-2xl border border-slate-800 flex items-center justify-between text-xs">
-              <div className="text-slate-400 truncate max-w-[280px]">
+              <div className="text-slate-400 truncate max-w-[260px]">
                 <strong className="text-slate-300 mr-1">Last Action:</strong>
                 {activeMatchModal.history && activeMatchModal.history.length > 0
                   ? <span className="text-amber-400 font-mono">{activeMatchModal.history[activeMatchModal.history.length - 1].type}</span>
@@ -860,16 +956,9 @@ export default function App() {
               <div className="flex gap-2">
                 <button
                   type="button"
-                  onClick={handleResetMatch}
-                  className="px-2.5 py-1.5 text-[11px] font-bold text-slate-400 hover:text-rose-400 border border-slate-800 rounded-lg hover:border-rose-900 transition"
-                >
-                  Reset 0-0
-                </button>
-                <button
-                  type="button"
                   disabled={!activeMatchModal.history || activeMatchModal.history.length === 0}
-                  onClick={handleUndo}
-                  className="px-3.5 py-1.5 text-xs font-black rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 disabled:opacity-30 disabled:pointer-events-none flex items-center gap-1.5 transition active:scale-95"
+                  onClick={handleUndoStepInModal}
+                  className="px-4 py-2 text-xs font-black rounded-xl bg-amber-500 text-slate-950 hover:bg-amber-400 disabled:opacity-30 disabled:pointer-events-none flex items-center gap-1.5 shadow-md shadow-amber-500/20 transition active:scale-95"
                 >
                   <span>↺ Undo Last Point</span>
                 </button>
@@ -878,7 +967,7 @@ export default function App() {
 
             {/* Modal Controls */}
             <div className="flex justify-end gap-2 border-t border-slate-800 pt-3">
-              <button onClick={() => setActiveMatchModal(null)} className="px-4 py-2 text-xs font-semibold text-slate-400">Cancel</button>
+              <button onClick={() => setActiveMatchModal(null)} className="px-4 py-2 text-xs font-semibold text-slate-400 hover:text-white">Cancel</button>
               <button
                 onClick={handleSaveMatchScore}
                 className="px-5 py-2 text-xs font-bold rounded-xl bg-gradient-to-r from-emerald-500 to-green-600 text-slate-950 uppercase"
